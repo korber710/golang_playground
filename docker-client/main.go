@@ -1,9 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"time"
 
@@ -20,6 +22,12 @@ type Controller struct {
 type VolumeMount struct {
 	HostPath   string
 	TargetPath string
+}
+
+type ExecResult struct {
+	StdOut   string
+	StdErr   string
+	ExitCode int
 }
 
 func NewController() (c *Controller, err error) {
@@ -159,6 +167,76 @@ func (c *Controller) ContainerRunAndClean(image string, command []string, volume
 	return statusCode, body, err
 }
 
+func (c *Controller) Exec(containerID string, command []string) (string, error) {
+	// Create exec config
+	config := types.ExecConfig{
+		AttachStderr: true,
+		AttachStdout: true,
+		Cmd:          command,
+	}
+
+	// Create the exec
+	execID, err := c.cli.ContainerExecCreate(context.Background(), containerID, config)
+
+	// Start the exec
+	c.cli.ContainerExecStart(context.Background())
+}
+
+func InspectExecResp(ctx context.Context, id string) (ExecResult, error) {
+	var execResult ExecResult
+	docker, err := client.NewEnvClient()
+	if err != nil {
+		return execResult, err
+	}
+	defer closer(docker)
+
+	resp, err := docker.ContainerExecAttach(ctx, id, types.ExecConfig{})
+	if err != nil {
+		return execResult, err
+	}
+	defer resp.Close()
+
+	// read the output
+	var outBuf, errBuf bytes.Buffer
+	outputDone := make(chan error)
+
+	go func() {
+		// StdCopy demultiplexes the stream into two buffers
+		_, err = stdcopy.StdCopy(&outBuf, &errBuf, resp.Reader)
+		outputDone <- err
+	}()
+
+	select {
+	case err := <-outputDone:
+		if err != nil {
+			return execResult, err
+		}
+		break
+
+	case <-ctx.Done():
+		return execResult, ctx.Err()
+	}
+
+	stdout, err := ioutil.ReadAll(&outBuf)
+	if err != nil {
+		return execResult, err
+	}
+	stderr, err := ioutil.ReadAll(&errBuf)
+	if err != nil {
+		return execResult, err
+	}
+
+	res, err := docker.ContainerExecInspect(ctx, id)
+	if err != nil {
+		return execResult, err
+	}
+
+	execResult.ExitCode = res.ExitCode
+	execResult.StdOut = string(stdout)
+	execResult.StdErr = string(stderr)
+	return execResult, nil
+}
+
 func main() {
 	// Create Docker Client Controller
 	_, err := NewController()
@@ -170,57 +248,6 @@ func main() {
 
 }
 
-// func CreateNewContainer(image string) (string, error) {
-// 	cli, err := client.NewClientWithOpts(client.FromEnv)
-// 	if err != nil {
-// 		fmt.Println("Unable to create docker client")
-// 		panic(err)
-// 	}
-
-// 	hostBinding := nat.PortBinding{
-// 		HostIP:   "0.0.0.0",
-// 		HostPort: "8000",
-// 	}
-// 	containerPort, err := nat.NewPort("tcp", "80")
-// 	if err != nil {
-// 		panic("Unable to get the port")
-// 	}
-
-// 	portBinding := nat.PortMap{containerPort: []nat.PortBinding{hostBinding}}
-// 	cont, err := cli.ContainerCreate(
-// 		context.Background(),
-// 		&container.Config{
-// 			Image: image,
-// 		},
-// 		&container.HostConfig{
-// 			PortBindings: portBinding,
-// 		}, nil, "")
-// 	if err != nil {
-// 		panic(err)
-// 	}
-
-// 	cli.ContainerStart(context.Background(), cont.ID, types.ContainerStartOptions{})
-// 	fmt.Printf("Container %s is started", cont.ID)
-// 	return cont.ID, nil
-// }
-
-// func ListContainer() error {
-// 	cli, err := client.NewClientWithOpts(client.FromEnv)
-// 	if err != nil {
-// 		panic(err)
-// 	}
-
-// 	containers, err := cli.ContainerList(context.Background(), types.ContainerListOptions{})
-// 	if err != nil {
-// 		panic(err)
-// 	}
-
-// 	if len(containers) > 0 {
-// 		for _, container := range containers {
-// 			fmt.Printf("Container ID: %s", container.ID)
-// 		}
-// 	} else {
-// 		fmt.Println("There are no containers running")
-// 	}
-// 	return nil
-// }
+// for exec: https://stackoverflow.com/questions/52774830/docker-exec-command-from-golang-api
+// examples: https://willschenk.com/articles/2021/controlling_docker_in_golang/
+// sdk: https://pkg.go.dev/github.com/docker/docker@v20.10.20+incompatible/client
