@@ -13,6 +13,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/client"
+	"github.com/docker/docker/pkg/stdcopy"
 )
 
 type Controller struct {
@@ -53,10 +54,10 @@ func (c *Controller) EnsureImage(image string) (err error) {
 }
 
 func (c *Controller) ContainerLog(id string) (result string, err error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	_, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	reader, err := c.cli.ContainerLogs(ctx, id, types.ContainerLogsOptions{
+	reader, err := c.cli.ContainerLogs(context.Background(), id, types.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true})
 
@@ -167,8 +168,48 @@ func (c *Controller) ContainerRunAndClean(image string, command []string, volume
 	return statusCode, body, err
 }
 
-func (c *Controller) Exec(containerID string, command []string) (string, error) {
+func (c *Controller) ContainerRunDetached(image string, volumes []VolumeMount) (id string, err error) {
+	// Start the container
+	hostConfig := container.HostConfig{}
+
+	var mounts []mount.Mount
+
+	for _, volume := range volumes {
+		mount := mount.Mount{
+			Type:   mount.TypeBind,
+			Source: volume.HostPath,
+			Target: volume.TargetPath,
+		}
+		mounts = append(mounts, mount)
+	}
+
+	hostConfig.Mounts = mounts
+
+	resp, err := c.cli.ContainerCreate(context.Background(), &container.Config{
+		Image: image,
+	}, &hostConfig, nil, nil, "")
+
+	if err != nil {
+		return "", err
+	}
+
+	err = c.cli.ContainerStart(context.Background(), resp.ID, types.ContainerStartOptions{})
+	if err != nil {
+		return resp.ID, err
+	}
+
+	// List containers
+	err = c.ListContainers()
+	if err != nil {
+		return resp.ID, err
+	}
+
+	return resp.ID, nil
+}
+
+func (c *Controller) Exec(containerID string, command []string) error {
 	// Create exec config
+	fmt.Println("Create config")
 	config := types.ExecConfig{
 		AttachStderr: true,
 		AttachStdout: true,
@@ -176,21 +217,53 @@ func (c *Controller) Exec(containerID string, command []string) (string, error) 
 	}
 
 	// Create the exec
-	execID, err := c.cli.ContainerExecCreate(context.Background(), containerID, config)
+	fmt.Println("Create the exec")
+	responseID, err := c.cli.ContainerExecCreate(context.Background(), containerID, config)
+	if err != nil {
+		return err
+	}
 
 	// Start the exec
-	c.cli.ContainerExecStart(context.Background())
+	fmt.Println("Start the exec")
+	err = c.cli.ContainerExecStart(context.Background(), responseID.ID, types.ExecStartCheck{})
+	if err != nil {
+		return err
+	}
+
+	// Get status
+	time.Sleep(5)
+	inspectResult, err := c.cli.ContainerExecInspect(context.Background(), responseID.ID)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Running:", inspectResult.Running)
+	fmt.Println("ExitCode:", inspectResult.ExitCode)
+	fmt.Println("Pid:", inspectResult.Pid)
+
+	// Get logs
+	log, err := c.ContainerLog(containerID)
+	if err != nil {
+		return err
+	}
+	fmt.Println("Logs:", log)
+
+	// Get the exec response
+	fmt.Println("Get the response")
+	var results ExecResult
+	results, err = c.InspectExecResp(containerID)
+
+	fmt.Println("Stdout:", results.StdOut)
+	fmt.Println("Stderr:", results.StdErr)
+	fmt.Println("Exit code:", results.ExitCode)
+
+	return err
 }
 
-func InspectExecResp(ctx context.Context, id string) (ExecResult, error) {
+func (c *Controller) InspectExecResp(containerID string) (ExecResult, error) {
 	var execResult ExecResult
-	docker, err := client.NewEnvClient()
-	if err != nil {
-		return execResult, err
-	}
-	defer closer(docker)
 
-	resp, err := docker.ContainerExecAttach(ctx, id, types.ExecConfig{})
+	fmt.Println("Exec attach")
+	resp, err := c.cli.ContainerExecAttach(context.Background(), containerID, types.ExecStartCheck{})
 	if err != nil {
 		return execResult, err
 	}
@@ -213,10 +286,11 @@ func InspectExecResp(ctx context.Context, id string) (ExecResult, error) {
 		}
 		break
 
-	case <-ctx.Done():
-		return execResult, ctx.Err()
+	case <-context.Background().Done():
+		return execResult, context.Background().Err()
 	}
 
+	fmt.Println("Read stdout")
 	stdout, err := ioutil.ReadAll(&outBuf)
 	if err != nil {
 		return execResult, err
@@ -226,7 +300,7 @@ func InspectExecResp(ctx context.Context, id string) (ExecResult, error) {
 		return execResult, err
 	}
 
-	res, err := docker.ContainerExecInspect(ctx, id)
+	res, err := c.cli.ContainerExecInspect(context.Background(), containerID)
 	if err != nil {
 		return execResult, err
 	}
@@ -235,6 +309,19 @@ func InspectExecResp(ctx context.Context, id string) (ExecResult, error) {
 	execResult.StdOut = string(stdout)
 	execResult.StdErr = string(stderr)
 	return execResult, nil
+}
+
+func (c *Controller) StopContainer(containerID string) (string, error) {
+	// Get the log
+	body, _ := c.ContainerLog(containerID)
+
+	err := c.cli.ContainerRemove(context.Background(), containerID, types.ContainerRemoveOptions{})
+
+	if err != nil {
+		fmt.Printf("Unable to remove container %q: %q\n", containerID, err)
+	}
+
+	return body, err
 }
 
 func main() {

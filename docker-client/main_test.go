@@ -74,3 +74,38 @@ func TestContainerRunWithMountedVolume(t *testing.T) {
 		t.Errorf("Expect status to be 0; received %q\n", statusCode)
 	}
 }
+
+func TestContainerRunWithCommand(t *testing.T) {
+	c, err := NewController()
+
+	if err != nil {
+		t.Error(err)
+	}
+
+	_ = c.ListContainers()
+
+	containerID, err := c.ContainerRunDetached("python:3.10-slim-buster", []VolumeMount{})
+
+	_ = c.ListContainers()
+
+	if err != nil {
+		t.Error(err)
+		t.FailNow()
+	}
+
+	err = c.Exec(containerID, []string{"/bin/bash", "ls", "-lah"})
+
+	if err != nil {
+		t.Error(err)
+		t.FailNow()
+	}
+
+	body, err := c.StopContainer(containerID)
+
+	if err != nil {
+		t.Error(err)
+		t.FailNow()
+	}
+
+	fmt.Println(body)
+}
