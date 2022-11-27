@@ -1,0 +1,3 @@
+- test: {passive: True, tags: "pass"}
+- test: {passive: True, tags: "pass2"}
+- hawk: {passive: False, tags: "sanity-test"}

@@ -1,0 +1,6 @@
+dev:
+  product: test
+  test: 
+    bakery:
+      - test: {passive: True, tags: "pass"}
+      - test: {passive: True, tags: "pass2"}
